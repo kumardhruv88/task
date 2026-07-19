@@ -1,8 +1,8 @@
 # Affiliate User Payout Management System
 
-> **SDE Intern Assignment** — Full-stack implementation of a User Payout Management System with advance payouts, reconciliation, and withdrawal management.
+A production-grade platform for managing affiliate commission payouts — covering advance disbursements, sale reconciliation, wallet management, and withdrawal workflows.
 
-**Live at:** `http://localhost:8542` (run `npm run dev`)
+**Run locally:** `npm run dev` → `http://localhost:8542`
 
 ---
 
@@ -18,15 +18,15 @@
 
 ---
 
-## Problem Statement
+## How It Works
 
-Every sale enters the system with status `PENDING`. The system must:
+Every sale enters the system with status `PENDING`. The platform then:
 
-1. **Advance Payout** — Pay 10% of commission immediately on PENDING sales (idempotent)
-2. **Reconciliation** — Admin approves/rejects sales; compute final payouts
-   - Approved: final payout = commission − advance
-   - Rejected: deduct advance from affiliate's future payout
-3. **Withdrawal** — Affiliate can withdraw once every 24 hours
+1. **Advance Payout** — Disburses 10% of commission immediately on PENDING sales (idempotent — guaranteed no double payments)
+2. **Reconciliation** — Admin approves or rejects sales; final payouts are calculated automatically
+   - Approved: final payout = commission − advance already paid
+   - Rejected: deducts the advance from the affiliate's wallet
+3. **Withdrawal** — Affiliates can request one payout withdrawal every 24 hours
 
 ---
 
