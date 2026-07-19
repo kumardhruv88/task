@@ -1,0 +1,49 @@
+# ─── Next.js ───────────────────────────────────────────────────────────────────
+.next/
+out/
+
+# ─── Dependencies ──────────────────────────────────────────────────────────────
+node_modules/
+.npm
+
+# ─── Environment — NEVER commit real credentials ───────────────────────────────
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+# Safe to commit:
+# .env.example
+
+# ─── Prisma ────────────────────────────────────────────────────────────────────
+prisma/generated/
+
+# ─── Build outputs ─────────────────────────────────────────────────────────────
+build/
+dist/
+
+# ─── TypeScript ────────────────────────────────────────────────────────────────
+*.tsbuildinfo
+next-env.d.ts
+
+# ─── OS & Editor ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.pem
+.idea/
+.vscode/settings.json
+
+# ─── Debug ─────────────────────────────────────────────────────────────────────
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ─── Vercel ────────────────────────────────────────────────────────────────────
+.vercel
+
+# ─── AI / Editor agent files ───────────────────────────────────────────────────
+CLAUDE.md
+.agents/
+
+# ─── Test coverage output ──────────────────────────────────────────────────────
+coverage/

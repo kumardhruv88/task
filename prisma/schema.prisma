@@ -1,0 +1,1033 @@
+// ──────────────────────────────────────────────────────────────────────────────
+// Affiliate User Payout Management System — Production Database Schema v1.0
+//
+// Design Principles:
+//   1. Money amounts: always Decimal(12,2). Never Float. Never lose precision.
+//   2. Commission rates: Decimal(5,4) — snapshotted at sale creation, immutable.
+//   3. Every money movement: append-only WalletLedger entry (immutable).
+//   4. Wallet balances: materialized cache + optimistic locking (version field).
+//   5. Duplicate payout prevention: @unique saleId on advance_payouts & final_payouts.
+//   6. Soft deletes: only User and Affiliate. Financial records are permanent.
+//   7. Audit logs: immutable, append-only, no updatedAt.
+//   8. All nullable relations: optional in Prisma to support nullable FKs.
+//
+// Table Count: 16 domain tables
+// ──────────────────────────────────────────────────────────────────────────────
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+// All enums use SCREAMING_SNAKE_CASE for values.
+// Enums are defined before models for readability.
+
+/// Internal operator privilege levels. Principle of least privilege.
+enum UserRole {
+  SUPER_ADMIN // Full system access including destructive ops and config
+  ADMIN // Approve/reject sales, manage affiliates, trigger reconciliation
+  MANAGER // Approve/reject sales; read-only on financial config
+  VIEWER // Read-only across all entities
+}
+
+/// Affiliate account lifecycle. Controls whether payouts are allowed.
+enum AffiliateStatus {
+  PENDING_VERIFICATION // Registered; awaiting KYC document verification
+  ACTIVE // Verified; can generate sales and receive payouts
+  INACTIVE // Voluntarily paused; no new payouts processed
+  SUSPENDED // Admin-suspended; all payouts halted
+}
+
+/// Sale lifecycle — the primary state machine driving payout eligibility.
+enum SaleStatus {
+  PENDING // Awaiting brand verification; advance payout may be requested (once)
+  APPROVED // Sale confirmed; triggers final payout creation
+  REJECTED // Sale rejected; any advance already paid must be recovered via reversal
+}
+
+/// Payout processing states — shared by AdvancePayout and FinalPayout.
+enum PayoutStatus {
+  PENDING // Queued; awaiting inclusion in a PayoutBatch
+  PROCESSING // Gateway API call initiated; awaiting confirmation
+  COMPLETED // Gateway confirmed funds transferred to affiliate
+  FAILED // Gateway returned an error; eligible for retry via SystemJob
+  CANCELLED // Manually cancelled by admin before processing began
+}
+
+/// Payout classification — determines which ledger entry type is created.
+enum PayoutType {
+  ADVANCE // 10% upfront disbursement on a PENDING sale
+  FINAL // Remaining commission disbursement when sale is APPROVED
+}
+
+/// Withdrawal request lifecycle with explicit fund-locking semantics.
+enum WithdrawalStatus {
+  PENDING // Submitted; funds are LOCKED (moved available → locked in wallet)
+  PROCESSING // Bank/UPI transfer in progress
+  COMPLETED // Funds delivered; locked amount permanently debited
+  FAILED // Transfer failed; locked amount returned to available
+  CANCELLED // Cancelled by affiliate; locked amount returned to available
+  REJECTED // Rejected by admin; locked amount returned to available
+}
+
+/// Per-attempt status for the WithdrawalAttempt retry history table.
+enum WithdrawalAttemptStatus {
+  PROCESSING // Gateway API call in flight
+  COMPLETED // This specific attempt succeeded
+  FAILED // This specific attempt failed; parent may retry
+}
+
+/// Supported payment rails for affiliate withdrawals.
+enum PaymentMethod {
+  UPI // Unified Payments Interface (India)
+  BANK_TRANSFER // NEFT/IMPS/RTGS bank transfer
+  WALLET // Future: platform internal wallet-to-wallet transfer
+}
+
+/// Immutable wallet ledger entry types.
+/// Direction (credit/debit effect on availableBalance) is encoded in the name.
+/// This eliminates the need for a separate "direction" column — intent is explicit.
+enum LedgerEntryType {
+  ADVANCE_PAYOUT_CREDIT // (+) Advance payout credited after gateway confirms
+  FINAL_PAYOUT_CREDIT // (+) Final payout credited after gateway confirms
+  WITHDRAWAL_LOCK // Moves amount: availableBalance → lockedBalance
+  WITHDRAWAL_UNLOCK // Moves amount: lockedBalance → availableBalance (on failure/cancel)
+  WITHDRAWAL_DEBIT // (-) Removes locked funds when withdrawal COMPLETES
+  ADJUSTMENT_CREDIT // (+) Admin manual credit: error correction, goodwill
+  ADJUSTMENT_DEBIT // (-) Admin manual debit: chargeback recovery, overpayment
+  REVERSAL_CREDIT // (+) Recovery credit if advance was paid on a REJECTED sale
+}
+
+/// Transaction type — classifies what kind of financial operation occurred.
+enum TransactionType {
+  ADVANCE_PAYOUT // Payment gateway disbursement for advance payout
+  FINAL_PAYOUT // Payment gateway disbursement for final payout
+  WITHDRAWAL // Payment gateway transfer for affiliate withdrawal
+  ADJUSTMENT // Internal manual balance adjustment (no gateway)
+  REVERSAL // Reversal of a previously completed transaction
+}
+
+/// Transaction processing states — mirrors gateway lifecycle.
+enum TransactionStatus {
+  PENDING // Queued; not yet sent to payment gateway
+  PROCESSING // Gateway API call in progress; awaiting webhook/polling
+  COMPLETED // Gateway confirmed success via webhook or polling
+  FAILED // Gateway returned failure or timeout
+  CANCELLED // Cancelled before gateway call was made
+  REVERSED // Successfully reversed (for chargebacks, error corrections)
+}
+
+/// Polymorphic discriminator — identifies which entity a Transaction belongs to.
+enum TransactionReferenceType {
+  ADVANCE_PAYOUT
+  FINAL_PAYOUT
+  WITHDRAWAL
+}
+
+/// Reconciliation run states.
+enum ReconciliationStatus {
+  RUNNING // Currently executing
+  COMPLETED // All wallets verified; no discrepancies
+  FAILED // Reconciliation job itself errored (not data issue)
+  DISCREPANCY_FOUND // Balance mismatches detected; awaiting manual review
+  RESOLVED // All discrepancies corrected and verified
+}
+
+/// How a reconciliation run was triggered.
+enum ReconciliationType {
+  SCHEDULED // Automated nightly via SystemJob (RECONCILE_WALLETS)
+  MANUAL // Triggered by admin from the dashboard
+  TRIGGERED // Triggered by anomaly detection (e.g., large unexpected balance delta)
+}
+
+/// Who/what performed an audited action.
+enum AuditActorType {
+  USER // Internal admin, manager, or viewer
+  SYSTEM // Automated background job (SystemJob execution)
+  API // External API consumer (brand webhook, integration)
+}
+
+/// Background job lifecycle states.
+enum JobStatus {
+  PENDING // Scheduled; not yet started
+  RUNNING // Currently executing
+  COMPLETED // Finished successfully
+  FAILED // Errored; will retry if attemptCount < maxAttempts
+  CANCELLED // Cancelled before execution began
+}
+
+/// Enumeration of all background job types in the system.
+enum JobType {
+  PROCESS_ADVANCE_PAYOUTS // Batch-process PENDING advance payouts into gateway calls
+  PROCESS_FINAL_PAYOUTS // Batch-process PENDING final payouts into gateway calls
+  PROCESS_WITHDRAWALS // Batch-process PENDING withdrawal requests
+  RETRY_FAILED_PAYOUTS // Retry FAILED advance/final payouts (exponential backoff)
+  RETRY_FAILED_WITHDRAWALS // Retry FAILED withdrawal transfers
+  RECONCILE_WALLETS // Nightly: verify wallet.availableBalance = Σ(ledger entries)
+  EXPIRE_IDEMPOTENCY_KEYS // Delete expired IdempotencyKey records (TTL cleanup)
+}
+
+// ─── Models ───────────────────────────────────────────────────────────────────
+// Ordered by domain dependency (referenced models before referencing models).
+
+// ── 1. User ──────────────────────────────────────────────────────────────────
+//
+// WHY: Internal operators who manage the affiliate system.
+//      Deliberately separate from Affiliate — different auth flow, different data.
+//      Admins approve/reject sales; the audit trail links actions back to this entity.
+//
+// RELATIONSHIPS:
+//   User →(1:N)→ AuditLog      (audit trail of all actions performed)
+//   User →(1:N)→ Sale          (approvedBy, rejectedBy — named relations)
+//   User →(1:N)→ Reconciliation (createdBy — for manual reconciliation runs)
+//
+// INDEXES:
+//   (role, isActive): Filter active users by role for access control checks
+//   (deletedAt): Partial soft-delete filtering across most queries
+
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  name         String
+  passwordHash String // bcrypt hash, minimum cost factor 12 — never plaintext
+  role         UserRole  @default(VIEWER)
+  isActive     Boolean   @default(true)
+  lastLoginAt  DateTime?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime? // Soft delete — preserve for complete audit trail
+
+  auditLogs       AuditLog[]
+  approvedSales   Sale[]           @relation("SaleApprover")
+  rejectedSales   Sale[]           @relation("SaleRejector")
+  reconciliations Reconciliation[]
+
+  @@index([role, isActive])
+  @@index([deletedAt])
+  @@map("users")
+}
+
+// ── 2. Affiliate ─────────────────────────────────────────────────────────────
+//
+// WHY: The partner entity that generates sales and earns commission payouts.
+//      Owns exactly one Wallet. Is the subject of every payout and withdrawal.
+//
+// RELATIONSHIPS:
+//   Affiliate →(1:1)→ Wallet           (one wallet per affiliate)
+//   Affiliate →(1:N)→ Sale             (all sales attributed to this affiliate)
+//   Affiliate →(1:N)→ AdvancePayout    (all advance payouts received)
+//   Affiliate →(1:N)→ FinalPayout      (all final payouts received)
+//   Affiliate →(1:N)→ Withdrawal       (all withdrawal requests made)
+//
+// INDEXES:
+//   (status): Filter active affiliates — most common filter in list queries
+//   (referralCode): Direct lookup by tracking link parameter
+//   (createdAt): Chronological listing
+//   (deletedAt): Soft delete filtering
+
+model Affiliate {
+  id           String          @id @default(cuid())
+  name         String
+  email        String          @unique
+  phone        String?
+  referralCode String          @unique // Tracking link identifier: ?ref=THIS_VALUE
+  status       AffiliateStatus @default(PENDING_VERIFICATION)
+
+  // Payment details — sensitive values encrypted by application layer before storage.
+  // Schema stores AES-256-GCM ciphertext; decryption happens in service layer via KMS.
+  // Masked values (e.g., "****4321") are safe to display in the dashboard.
+  preferredPaymentMethod PaymentMethod?
+  encryptedBankAccount   String? // Ciphertext of account number
+  encryptedIfscCode      String? // Ciphertext of IFSC code
+  maskedBankAccount      String? // "****4321" — safe for display
+  bankName               String? // "HDFC Bank" — for display
+  encryptedUpiId         String? // Ciphertext of UPI ID
+  maskedUpiId            String? // Masked UPI ID — safe for display
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime? // Soft delete — financial history must persist after deactivation
+
+  wallet         Wallet?
+  sales          Sale[]
+  withdrawals    Withdrawal[]
+  advancePayouts AdvancePayout[]
+  finalPayouts   FinalPayout[]
+
+  @@index([status])
+  @@index([referralCode])
+  @@index([createdAt])
+  @@index([deletedAt])
+  @@map("affiliates")
+}
+
+// ── 3. Brand ─────────────────────────────────────────────────────────────────
+//
+// WHY: A merchant/company whose products affiliates promote.
+//      Defines commission rates that are snapshotted into each Sale at creation.
+//      Rate changes on Brand do NOT retroactively affect existing sales.
+//
+// RELATIONSHIPS:
+//   Brand →(1:N)→ Sale (all sales for this brand's products)
+//
+// INDEXES:
+//   (slug): URL-safe lookup by brand identifier
+//   (isActive): Filter active brands in dropdown/autocomplete
+
+model Brand {
+  id   String @id @default(cuid())
+  name String @unique
+  slug String @unique // URL-safe: "samsung-india", "myntra"
+
+  // Commission rates — stored as Decimal(5,4) fraction.
+  // 0.1500 = 15% commission on every sale.
+  // Snapshotted into Sale.commissionRate at sale creation — never retroactively applied.
+  commissionRate Decimal @db.Decimal(5, 4)
+
+  // Fraction of commission paid as advance on PENDING sales.
+  // 0.1000 = 10% advance (system default, per assignment spec).
+  // Configurable per brand (some brands may offer 15% advance to premium affiliates).
+  advanceRate Decimal @default(0.1000) @db.Decimal(5, 4)
+
+  isActive Boolean @default(true)
+  // Flexible metadata: webhookUrl, webhookSecretHash, logoUrl, description
+  metadata Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sales Sale[]
+
+  @@index([slug])
+  @@index([isActive])
+  @@map("brands")
+}
+
+// ── 4. Sale ───────────────────────────────────────────────────────────────────
+//
+// WHY: The core domain entity — every affiliate earnings event originates here.
+//      Commission amounts are computed ONCE at creation and stored permanently.
+//      The state machine (PENDING → APPROVED/REJECTED) drives payout creation.
+//
+// RELATIONSHIPS:
+//   Sale →(N:1)→ Affiliate       (who earned this commission)
+//   Sale →(N:1)→ Brand           (which brand's product was sold)
+//   Sale →(N:1)→ User            (who approved/rejected, via named relations)
+//   Sale →(1:0..1)→ AdvancePayout (at most 1 advance payout per sale; @unique enforced)
+//   Sale →(1:0..1)→ FinalPayout   (at most 1 final payout per sale; @unique enforced)
+//
+// INDEXES:
+//   (affiliateId, status)   : "All pending sales for affiliate X" — dashboard query
+//   (brandId, status)       : "Sales per brand" — reporting query
+//   (status, createdAt)     : Batch job — find all PENDING sales ordered by time
+//   (approvedById)          : "Sales approved by manager Y" — audit query
+//   (reconciledAt)          : Reconciliation — find unreconciled sales
+
+model Sale {
+  id          String @id @default(cuid())
+  affiliateId String
+  brandId     String
+
+  // External order ID from the brand's e-commerce/payment system.
+  // @unique prevents duplicate ingestion if brand retries their webhook.
+  // This is the primary idempotency mechanism for sale creation.
+  externalOrderId String @unique
+
+  // Gross value of the sale transaction in INR
+  saleAmount Decimal @db.Decimal(12, 2)
+
+  // Commission fields — computed at sale creation, NEVER modified after.
+  // Rationale: changing commissionRate on Brand months later must not affect
+  // historical earnings. Affiliates signed up expecting a specific rate.
+  commissionRate   Decimal @db.Decimal(5, 4) // Snapshot of Brand.commissionRate
+  commissionAmount Decimal @db.Decimal(12, 2) // saleAmount × commissionRate
+  advanceRate      Decimal @db.Decimal(5, 4) // Snapshot of Brand.advanceRate
+  advanceAmount    Decimal @db.Decimal(12, 2) // commissionAmount × advanceRate (10%)
+  finalAmount      Decimal @db.Decimal(12, 2) // commissionAmount − advanceAmount (90%)
+
+  status SaleStatus @default(PENDING)
+
+  // Approval / rejection — tracks the human decision and timestamp
+  approvedAt      DateTime?
+  approvedById    String? // Null for system auto-approval pipelines
+  rejectedAt      DateTime?
+  rejectedById    String?
+  rejectionReason String? // Required when rejecting; stored for affiliate dispute resolution
+
+  // Set by reconciliation job once this sale is included in a reconciliation run
+  reconciledAt DateTime?
+
+  // Flexible metadata from brand webhook: UTM parameters, product SKUs,
+  // customer country, cart ID, IP address, conversion funnel data
+  metadata Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  affiliate     Affiliate      @relation(fields: [affiliateId], references: [id])
+  brand         Brand          @relation(fields: [brandId], references: [id])
+  approvedBy    User?          @relation("SaleApprover", fields: [approvedById], references: [id])
+  rejectedBy    User?          @relation("SaleRejector", fields: [rejectedById], references: [id])
+  advancePayout AdvancePayout? // @unique on AdvancePayout.saleId enforces max 1
+  finalPayout   FinalPayout? // @unique on FinalPayout.saleId enforces max 1
+
+  @@index([affiliateId, status])
+  @@index([brandId, status])
+  @@index([status, createdAt])
+  @@index([approvedById])
+  @@index([reconciledAt])
+  @@map("sales")
+}
+
+// ── 5. Wallet ─────────────────────────────────────────────────────────────────
+//
+// WHY: Maintains the materialized financial state for each affiliate.
+//      Stores availableBalance and lockedBalance as performance-optimised caches
+//      over the WalletLedger. This avoids a full ledger scan on every balance check.
+//
+// CONSISTENCY MODEL:
+//   All balance mutations MUST:
+//     1. Run inside a PostgreSQL transaction (BEGIN / COMMIT)
+//     2. Use optimistic locking: UPDATE WHERE id = X AND version = currentVersion
+//     3. If rows affected = 0, retry the operation (version mismatch = concurrent write)
+//     4. Simultaneously insert an immutable WalletLedger entry in the same transaction
+//   This guarantees wallet balance = Σ(ledger entries) at all times.
+//
+// RELATIONSHIPS:
+//   Wallet →(1:1)→ Affiliate     (one wallet per affiliate)
+//   Wallet →(1:N)→ WalletLedger  (every money movement recorded here)
+//
+// INDEXES: None beyond PK — affiliateId is @unique, enabling direct O(1) lookup
+
+model Wallet {
+  id          String @id @default(cuid())
+  affiliateId String @unique // Enforces: one wallet per affiliate, always
+
+  // Materialized balance — updated atomically with every WalletLedger insert.
+  // availableBalance is what the affiliate can request to withdraw.
+  availableBalance Decimal @default(0) @db.Decimal(12, 2)
+
+  // Funds locked by in-flight Withdrawal requests.
+  // Locked = reserved from availableBalance; not yet permanently debited.
+  // availableBalance + lockedBalance = total accrued but not yet withdrawn.
+  lockedBalance Decimal @default(0) @db.Decimal(12, 2)
+
+  // Running totals — never decremented; monotonically increasing.
+  lifetimeEarnings  Decimal @default(0) @db.Decimal(12, 2) // Sum of all credits ever
+  lifetimeWithdrawn Decimal @default(0) @db.Decimal(12, 2) // Sum of all completed withdrawals
+
+  // Optimistic lock counter.
+  // Application pattern: UPDATE wallets SET version = version + 1, availableBalance = $new
+  //                      WHERE id = $id AND version = $currentVersion
+  // If UPDATE affects 0 rows → version mismatch → retry entire operation.
+  version Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  affiliate     Affiliate      @relation(fields: [affiliateId], references: [id])
+  ledgerEntries WalletLedger[]
+
+  @@map("wallets")
+}
+
+// ── 6. WalletLedger ──────────────────────────────────────────────────────────
+//
+// WHY: The immutable source of truth for all money movements.
+//      Every credit and debit is recorded here permanently — never updated, never deleted.
+//      wallet.availableBalance can always be recomputed as:
+//        SELECT SUM(CASE WHEN type IN (...CREDITS) THEN amount ELSE -amount END)
+//        FROM wallet_ledger WHERE walletId = X
+//      This is the "ledger" in double-entry bookkeeping terminology.
+//
+// IMMUTABILITY: No updatedAt field — intentional. Once written, entries are permanent.
+//
+// RELATIONSHIPS:
+//   WalletLedger →(N:1)→ Wallet      (which wallet this entry belongs to)
+//   WalletLedger →(N:1)→ Transaction (what gateway event caused this entry; nullable)
+//
+// INDEXES:
+//   (walletId, createdAt): Paginated ledger history — most common query pattern
+//   (walletId, type):      Filter by entry type (e.g., show only credits)
+//   (transactionId):       Reverse lookup from a Transaction to its ledger entries
+
+model WalletLedger {
+  id            String  @id @default(cuid())
+  walletId      String
+  transactionId String? // Null for admin adjustments without a gateway transaction
+
+  type   LedgerEntryType
+  amount Decimal         @db.Decimal(12, 2) // Always positive — direction encoded in type
+
+  // Wallet.availableBalance immediately AFTER this entry was applied.
+  // Enables point-in-time balance lookup without full ledger aggregate scan.
+  // Critical for debugging ("what was the balance at 2pm on Monday?").
+  runningBalance Decimal @db.Decimal(12, 2)
+
+  // Human-readable description for the affiliate portal and support dashboard.
+  // Examples:
+  //   "Advance payout for order ORD-12345 (Brand: Samsung India)"
+  //   "Withdrawal to HDFC ****4321"
+  //   "Manual adjustment by Admin: overpayment correction"
+  description String
+
+  metadata Json? // saleId, batchId, adminUserId, orderId — flexible reference data
+
+  createdAt DateTime @default(now())
+  // Intentionally NO updatedAt — ledger entries are immutable
+
+  wallet      Wallet       @relation(fields: [walletId], references: [id])
+  transaction Transaction? @relation(fields: [transactionId], references: [id])
+
+  @@index([walletId, createdAt])
+  @@index([walletId, type])
+  @@index([transactionId])
+  @@map("wallet_ledger")
+}
+
+// ── 7. AdvancePayout ─────────────────────────────────────────────────────────
+//
+// WHY: Represents the 10% advance disbursement for a specific PENDING sale.
+//      The @unique constraint on saleId is the PRIMARY database-level guarantee
+//      that no sale ever receives more than one advance payout. This is irrespective
+//      of application-layer bugs, retries, or race conditions.
+//
+// RELATIONSHIPS:
+//   AdvancePayout →(N:1)→ Sale         (which sale this advance is for)
+//   AdvancePayout →(N:1)→ Affiliate    (denormalized for query performance)
+//   AdvancePayout →(N:1)→ PayoutBatch  (optional grouping for batch processing)
+//   AdvancePayout →(1:N)→ Transaction  (each gateway attempt creates a Transaction)
+//
+// INDEXES:
+//   (affiliateId, status):  Affiliate's payout history — dashboard query
+//   (status, createdAt):    Batch processing — find PENDING payouts in order
+//   (batchId):              Batch-level aggregate queries
+//   (nextRetryAt, status):  Retry job — WHERE nextRetryAt <= now() AND status = FAILED
+
+model AdvancePayout {
+  id          String  @id @default(cuid())
+  saleId      String  @unique // DATABASE CONSTRAINT: one advance per sale, forever
+  affiliateId String // Denormalized — avoids join on every payout list query
+  batchId     String? // Grouped for bulk processing via PayoutBatch
+
+  amount Decimal      @db.Decimal(12, 2) // = Sale.advanceAmount at time of request
+  status PayoutStatus @default(PENDING)
+
+  // Payment gateway interaction details
+  gatewayReference String? // Gateway's unique payout/transfer ID
+  processedAt      DateTime? // When the gateway API call was initiated
+  completedAt      DateTime? // When gateway webhook confirmed success
+  failedAt         DateTime?
+  failureReason    String? // Human-readable: "Beneficiary account frozen"
+  failureCode      String? // Machine-readable: "BENEFICIARY_ACCOUNT_FROZEN"
+
+  // Retry management — exponential backoff: 5m → 15m → 1h → 4h → 24h
+  attemptCount  Int       @default(0)
+  lastAttemptAt DateTime?
+  nextRetryAt   DateTime? // Null when not retryable; set by RETRY_FAILED_PAYOUTS job
+
+  metadata  Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sale         Sale          @relation(fields: [saleId], references: [id])
+  affiliate    Affiliate     @relation(fields: [affiliateId], references: [id])
+  batch        PayoutBatch?  @relation("BatchAdvancePayouts", fields: [batchId], references: [id])
+  transactions Transaction[] @relation("AdvancePayoutTransactions")
+
+  @@index([affiliateId, status])
+  @@index([status, createdAt])
+  @@index([batchId])
+  @@index([nextRetryAt, status])
+  @@map("advance_payouts")
+}
+
+// ── 8. FinalPayout ───────────────────────────────────────────────────────────
+//
+// WHY: Represents the remaining commission (90%, or 100% if no advance was paid)
+//      disbursement triggered when a sale transitions from PENDING to APPROVED.
+//      The @unique constraint on saleId prevents double-payment if the approval
+//      event fires multiple times (e.g., webhook retry, duplicate processing).
+//
+// RELATIONSHIPS:
+//   FinalPayout →(N:1)→ Sale         (the approved sale)
+//   FinalPayout →(N:1)→ Affiliate    (denormalized for performance)
+//   FinalPayout →(N:1)→ PayoutBatch  (optional batch grouping)
+//   FinalPayout →(1:N)→ Transaction  (each gateway attempt)
+//
+// INDEXES: Same rationale as AdvancePayout
+
+model FinalPayout {
+  id          String  @id @default(cuid())
+  saleId      String  @unique // DATABASE CONSTRAINT: one final payout per sale
+  affiliateId String
+  batchId     String?
+
+  // Net amount to disburse.
+  // If advance was paid: amount = Sale.finalAmount (= commissionAmount * 90%)
+  // If advance was NOT paid: amount = Sale.commissionAmount (full 100%)
+  amount Decimal @db.Decimal(12, 2)
+
+  // Tracks how much advance was deducted for reconciliation clarity.
+  // advanceDeducted = Sale.advanceAmount if advance was paid; 0 otherwise.
+  advanceDeducted Decimal @default(0) @db.Decimal(12, 2)
+
+  status PayoutStatus @default(PENDING)
+
+  gatewayReference String?
+  processedAt      DateTime?
+  completedAt      DateTime?
+  failedAt         DateTime?
+  failureReason    String?
+  failureCode      String?
+
+  attemptCount  Int       @default(0)
+  lastAttemptAt DateTime?
+  nextRetryAt   DateTime?
+
+  metadata  Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sale         Sale          @relation(fields: [saleId], references: [id])
+  affiliate    Affiliate     @relation(fields: [affiliateId], references: [id])
+  batch        PayoutBatch?  @relation("BatchFinalPayouts", fields: [batchId], references: [id])
+  transactions Transaction[] @relation("FinalPayoutTransactions")
+
+  @@index([affiliateId, status])
+  @@index([status, createdAt])
+  @@index([batchId])
+  @@index([nextRetryAt, status])
+  @@map("final_payouts")
+}
+
+// ── 9. Withdrawal ─────────────────────────────────────────────────────────────
+//
+// WHY: Represents an affiliate's request to move available wallet balance
+//      to their bank account or UPI ID. Rate-limited to 1 per 24-hour window.
+//
+// FUND LOCKING PROTOCOL:
+//   On PENDING: Create WITHDRAWAL_LOCK ledger entry (available → locked)
+//   On COMPLETED: Create WITHDRAWAL_DEBIT ledger entry (locked → gone)
+//   On FAILED/CANCELLED/REJECTED: Create WITHDRAWAL_UNLOCK (locked → available)
+//   This ensures funds can never be "lost" due to failed transfers.
+//
+// 24-HOUR RATE LIMIT:
+//   Enforced at application layer (not DB constraint — timestamps don't lend
+//   themselves cleanly to unique constraints). Query pattern:
+//     SELECT COUNT(*) FROM withdrawals
+//     WHERE affiliateId = $1 AND createdAt > NOW() - INTERVAL '24 hours'
+//     AND status NOT IN ('CANCELLED', 'REJECTED')
+//   The (affiliateId, createdAt) index makes this O(log n).
+//
+// PAYMENT DETAIL IMMUTABILITY:
+//   Masked payment details (maskedBankAccount, maskedUpiId) are snapshotted
+//   at request time. If affiliate changes payment details later, this record
+//   remains an accurate historical record of where funds were sent.
+//
+// RELATIONSHIPS:
+//   Withdrawal →(N:1)→ Affiliate         (who requested this withdrawal)
+//   Withdrawal →(1:N)→ WithdrawalAttempt (retry history per attempt)
+//   Withdrawal →(1:N)→ Transaction       (gateway calls for each attempt)
+
+model Withdrawal {
+  id          String @id @default(cuid())
+  affiliateId String
+
+  amount Decimal          @db.Decimal(12, 2)
+  status WithdrawalStatus @default(PENDING)
+
+  // Payment destination — snapshotted at submission time for permanent accuracy
+  paymentMethod     PaymentMethod
+  maskedBankAccount String? // "****4321" — for support dashboard display
+  bankName          String? // "HDFC Bank" — for display
+  maskedUpiId       String? // "user@oksbi" — masked version for display
+
+  // Timing
+  processedAt DateTime? // When transfer was initiated
+  completedAt DateTime? // When bank/UPI confirmed receipt
+
+  // Failure and rejection — admin decision captured with reason for disputes
+  rejectedAt      DateTime?
+  rejectedById    String?
+  rejectionReason String?
+  failureReason   String?
+  failureCode     String?
+
+  metadata  Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  affiliate    Affiliate           @relation(fields: [affiliateId], references: [id])
+  attempts     WithdrawalAttempt[]
+  transactions Transaction[]       @relation("WithdrawalTransactions")
+
+  @@index([affiliateId, createdAt]) // Rate limit check — most critical index
+  @@index([affiliateId, status]) // Affiliate's withdrawal history
+  @@index([status, createdAt]) // Processing job — find PENDING withdrawals
+  @@map("withdrawals")
+}
+
+// ── 10. WithdrawalAttempt ────────────────────────────────────────────────────
+//
+// WHY: Records each individual processing attempt for a withdrawal separately.
+//      A single Withdrawal may have 1-3 attempts (exponential backoff).
+//      This provides:
+//        - Complete retry history with timestamps
+//        - Per-attempt gateway response for debugging
+//        - SLA tracking: how long did each attempt take?
+//        - Root cause analysis: did attempt 1 fail on timeout vs invalid account?
+//
+// RELATIONSHIPS:
+//   WithdrawalAttempt →(N:1)→ Withdrawal (which withdrawal this attempt belongs to)
+//
+// INDEXES:
+//   (withdrawalId): All attempts for a given withdrawal
+
+model WithdrawalAttempt {
+  id            String @id @default(cuid())
+  withdrawalId  String
+  attemptNumber Int // 1-based: 1, 2, 3 — per withdrawal, not global
+
+  status WithdrawalAttemptStatus
+
+  // Raw gateway interaction — preserved for debugging and support escalation
+  gatewayName      String? // "RAZORPAY_X2", "CASHFREE", "PAYTM_PAYOUTS"
+  gatewayReference String? // Gateway's unique transfer/payout ID
+  gatewayResponse  Json? // Full raw API response body
+
+  failureReason String?
+  failureCode   String?
+
+  attemptedAt DateTime  @default(now())
+  completedAt DateTime?
+
+  withdrawal Withdrawal @relation(fields: [withdrawalId], references: [id])
+
+  @@unique([withdrawalId, attemptNumber]) // Prevent duplicate attempt numbering
+  @@index([withdrawalId])
+  @@map("withdrawal_attempts")
+}
+
+// ── 11. Transaction ──────────────────────────────────────────────────────────
+//
+// WHY: Records every payment gateway interaction as a permanent, traceable event.
+//      This is separate from WalletLedger — a Transaction records the gateway
+//      call, while WalletLedger records the accounting impact.
+//
+// POLYMORPHIC DESIGN:
+//   A Transaction belongs to exactly one of: AdvancePayout, FinalPayout, or Withdrawal.
+//   This is modeled with nullable FKs + a TransactionReferenceType discriminator.
+//   Exactly one FK should be non-null (enforced at application layer).
+//   Rationale: FK-based polymorphism preserves referential integrity; JSON-based
+//   polymorphism (storing parent ID in a Json field) does not.
+//
+// RELATIONSHIPS:
+//   Transaction →(N:1)→ AdvancePayout  (optional — if type is ADVANCE_PAYOUT)
+//   Transaction →(N:1)→ FinalPayout    (optional — if type is FINAL_PAYOUT)
+//   Transaction →(N:1)→ Withdrawal     (optional — if type is WITHDRAWAL)
+//   Transaction →(1:N)→ WalletLedger   (accounting entries triggered by this transaction)
+//
+// INDEXES:
+//   (type, status):        Processing — find pending transactions by type
+//   (status, createdAt):   Dashboard — recent transaction history
+//   (gatewayReference):    Webhook handler — O(1) lookup by gateway's ID
+//   (advancePayoutId):     Reverse lookup — all transactions for an advance payout
+//   (finalPayoutId):       Reverse lookup — all transactions for a final payout
+//   (withdrawalId):        Reverse lookup — all transactions for a withdrawal
+
+model Transaction {
+  id String @id @default(cuid())
+
+  type   TransactionType
+  status TransactionStatus @default(PENDING)
+
+  amount   Decimal @db.Decimal(12, 2)
+  currency String  @default("INR") @db.VarChar(3)
+
+  // Polymorphic parent reference — exactly one FK non-null, discriminated by referenceType
+  referenceType   TransactionReferenceType?
+  advancePayoutId String?
+  finalPayoutId   String?
+  withdrawalId    String?
+
+  // Payment gateway details — raw interaction record
+  gatewayName      String? // "RAZORPAY", "CASHFREE", "PAYTM_PAYOUTS"
+  gatewayReference String? // Gateway's unique transaction/payout/transfer ID
+  gatewayResponse  Json? // Full raw API response — critical for support and debugging
+
+  // For REVERSAL type — links to the original transaction being reversed
+  reversedTransactionId String?
+
+  failureReason String?
+  failureCode   String? // Machine-readable code from gateway error response
+
+  // API-level idempotency key — prevents duplicate gateway calls on retry.
+  // Follows Stripe's idempotency-key pattern.
+  idempotencyKey String? @unique
+
+  metadata  Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  advancePayout AdvancePayout? @relation("AdvancePayoutTransactions", fields: [advancePayoutId], references: [id])
+  finalPayout   FinalPayout?   @relation("FinalPayoutTransactions", fields: [finalPayoutId], references: [id])
+  withdrawal    Withdrawal?    @relation("WithdrawalTransactions", fields: [withdrawalId], references: [id])
+  ledgerEntries WalletLedger[]
+
+  @@index([type, status])
+  @@index([status, createdAt])
+  @@index([gatewayReference])
+  @@index([advancePayoutId])
+  @@index([finalPayoutId])
+  @@index([withdrawalId])
+  @@map("transactions")
+}
+
+// ── 12. PayoutBatch ──────────────────────────────────────────────────────────
+//
+// WHY: Groups multiple advance or final payouts for efficient batch processing.
+//      Instead of N individual gateway API calls (N network round trips),
+//      a batch groups N payouts into a single API call where gateway supports it.
+//      Also provides progress tracking: successCount / totalCount for monitoring.
+//
+// RELATIONSHIPS:
+//   PayoutBatch →(1:N)→ AdvancePayout  (advance payouts in this batch)
+//   PayoutBatch →(1:N)→ FinalPayout    (final payouts in this batch)
+//   Note: A batch contains either advance OR final payouts, not both.
+//         The `type` field discriminates.
+//
+// INDEXES:
+//   (status, createdAt): Processing — find active/pending batches
+//   (type, status):      Dashboard — filter by payout type
+
+model PayoutBatch {
+  id     String     @id @default(cuid())
+  type   PayoutType
+  status JobStatus  @default(PENDING)
+
+  // Aggregate statistics — updated atomically as each payout processes
+  totalAmount  Decimal @db.Decimal(12, 2)
+  totalCount   Int
+  successCount Int     @default(0)
+  failureCount Int     @default(0)
+  // pendingCount = totalCount - successCount - failureCount (computed by application)
+
+  processedAt DateTime? // When batch processing began
+  completedAt DateTime? // When last payout reached terminal state
+
+  metadata  Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  advancePayouts AdvancePayout[] @relation("BatchAdvancePayouts")
+  finalPayouts   FinalPayout[]   @relation("BatchFinalPayouts")
+
+  @@index([status, createdAt])
+  @@index([type, status])
+  @@map("payout_batches")
+}
+
+// ── 13. Reconciliation ───────────────────────────────────────────────────────
+//
+// WHY: Periodic verification that materialized wallet balances match ledger sums.
+//      Even with optimistic locking, production systems can develop balance drift
+//      due to edge cases: server crashes mid-transaction, bug deployments, infra
+//      failures. Reconciliation detects and corrects this drift systematically.
+//
+// HOW IT WORKS:
+//   For each wallet in scope:
+//     1. Compute expected = Σ(wallet_ledger amounts, applying type direction)
+//     2. Read actual = wallet.availableBalance
+//     3. If |expected - actual| > threshold → record discrepancy
+//     4. For each discrepancy: create ADJUSTMENT_CREDIT or ADJUSTMENT_DEBIT + AuditLog
+//
+// RELATIONSHIPS:
+//   Reconciliation →(N:1)→ User (who triggered it; null for scheduled runs)
+//
+// INDEXES:
+//   (status, createdAt):      Dashboard — recent reconciliation runs
+//   (affiliateId, createdAt): Per-affiliate reconciliation history
+
+model Reconciliation {
+  id     String               @id @default(cuid())
+  type   ReconciliationType
+  status ReconciliationStatus
+
+  startedAt   DateTime
+  completedAt DateTime?
+
+  // Scope — null affiliateId means full-system reconciliation (all wallets)
+  affiliateId String?
+  periodStart DateTime // Ledger entries from this timestamp
+  periodEnd   DateTime // Ledger entries to this timestamp
+
+  // Summary statistics
+  totalWalletsChecked   Int     @default(0)
+  discrepanciesFound    Int     @default(0)
+  discrepanciesResolved Int     @default(0)
+  // Σ|expected - actual| — measures total drift severity
+  totalDriftAmount      Decimal @default(0) @db.Decimal(14, 2)
+
+  // Discrepancy detail array.
+  // Schema: [{affiliateId, walletId, expected, actual, delta, resolvedAt, resolution}]
+  // For large-scale production (millions of affiliates): extract to ReconciliationItem table.
+  discrepancies Json?
+
+  createdById String? // null for SCHEDULED type
+  notes       String? // Admin notes on findings
+  metadata    Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  createdBy User? @relation(fields: [createdById], references: [id])
+
+  @@index([status, createdAt])
+  @@index([affiliateId, createdAt])
+  @@map("reconciliations")
+}
+
+// ── 14. AuditLog ─────────────────────────────────────────────────────────────
+//
+// WHY: Provides a permanent, tamper-evident record of every important action.
+//      Required for financial compliance, fraud investigation, and dispute resolution.
+//      "Who approved this sale, when, from what IP?" must always be answerable.
+//
+// IMMUTABILITY: No updatedAt field — intentional. Audit entries are permanent.
+//      In production: partition this table by createdAt (monthly) for query performance
+//      and archive old partitions to cold storage (e.g., S3).
+//
+// RELATIONSHIPS:
+//   AuditLog →(N:1)→ User (who performed the action; null for SYSTEM/API actors)
+//
+// INDEXES:
+//   (entityType, entityId): "Full trail for Sale abc123" — most common audit query
+//   (actorId, createdAt):   "All actions by Manager Y this month"
+//   (action, createdAt):    "All SALE_APPROVED events this week" — compliance reports
+//   (createdAt):            Time-range audit queries
+
+model AuditLog {
+  id String @id @default(cuid())
+
+  // WHO performed the action
+  actorType AuditActorType
+  actorId   String? // User.id for USER type; null for SYSTEM and API
+  actor     User?          @relation(fields: [actorId], references: [id])
+
+  // WHAT action was performed — past-tense SCREAMING_SNAKE_CASE verb
+  // Examples: SALE_APPROVED, SALE_REJECTED, WITHDRAWAL_REJECTED,
+  //           AFFILIATE_SUSPENDED, ADVANCE_PAYOUT_FAILED, WALLET_ADJUSTED
+  action String
+
+  // WHICH entity was affected
+  entityType String // "Sale", "Withdrawal", "Affiliate", "AdvancePayout", etc.
+  entityId   String
+
+  // Change data capture — JSON snapshots for full before/after visibility
+  oldValues Json? // Complete entity state before the action
+  newValues Json? // Complete entity state after the action; null if entity was created
+
+  // Request context — essential for security audit and incident investigation
+  ipAddress String?
+  userAgent String?
+  requestId String? // Distributed tracing correlation ID (e.g., X-Request-ID header)
+
+  metadata Json? // Additional context: admin notes, computed diffs, reason codes
+
+  createdAt DateTime @default(now())
+  // Intentionally NO updatedAt — audit logs are immutable by design
+
+  @@index([entityType, entityId])
+  @@index([actorId, createdAt])
+  @@index([action, createdAt])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// ── 15. SystemJob ────────────────────────────────────────────────────────────
+//
+// WHY: Every background job execution is tracked for observability, alerting,
+//      and retry management. Without this table, failed jobs are invisible.
+//      Operations teams can query this table to understand system health:
+//        "Did tonight's reconciliation job complete successfully?"
+//        "How many failed payout retries are pending?"
+//
+// RELATIONSHIPS: None — SystemJob is a standalone observability entity.
+//
+// INDEXES:
+//   (type, status):        "All running reconciliation jobs"
+//   (status, scheduledAt): Scheduler — find next job ready to execute
+//   (nextRetryAt, status): Retry processor — find failed jobs ready to retry
+
+model SystemJob {
+  id     String    @id @default(cuid())
+  type   JobType
+  status JobStatus @default(PENDING)
+
+  payload Json? // Input parameters for this execution (e.g., batchId, affiliateId scope)
+  result  Json? // Summary output on completion (e.g., processedCount, successCount)
+  error   String? // Error message or serialized exception on failure
+
+  scheduledAt DateTime // When this job was scheduled to run
+  startedAt   DateTime? // When execution actually began (may differ from scheduledAt)
+  completedAt DateTime? // When execution reached a terminal state
+
+  // Retry management — exponential backoff between attempts
+  attemptCount Int       @default(0)
+  maxAttempts  Int       @default(3)
+  nextRetryAt  DateTime? // Null = not scheduled for retry (maxAttempts reached or CANCELLED)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([type, status])
+  @@index([status, scheduledAt])
+  @@index([nextRetryAt, status])
+  @@map("system_jobs")
+}
+
+// ── 16. IdempotencyKey ───────────────────────────────────────────────────────
+//
+// WHY: Prevents duplicate operations when clients retry API calls due to
+//      network failures or timeouts. Follows Stripe's idempotency-key pattern.
+//
+// FLOW:
+//   1. Client sends request with X-Idempotency-Key: <uuid> header
+//   2. Server checks IdempotencyKey.key → if found and not expired:
+//        return cached responseStatus and responseBody immediately
+//   3. If not found: process request, store result in IdempotencyKey, return response
+//   4. If found but still processing (responseStatus = null):
+//        return 409 Conflict (request in flight — retry after delay)
+//   5. Cleanup job (EXPIRE_IDEMPOTENCY_KEYS) deletes records past expiresAt
+//
+// TTL: Typically 24 hours — client must use a fresh key per new operation.
+//
+// RELATIONSHIPS: None — standalone deduplication table.
+//
+// INDEXES:
+//   (key):       Primary lookup — every API request checks here first
+//   (expiresAt): Cleanup job — DELETE WHERE expiresAt < NOW()
+
+model IdempotencyKey {
+  id  String @id @default(cuid())
+  key String @unique // Client-provided UUID or hash (from X-Idempotency-Key header)
+
+  operationType String // "REQUEST_ADVANCE_PAYOUT", "CREATE_WITHDRAWAL", etc.
+  entityId      String? // ID of the entity created by this operation (set after processing)
+
+  // Cached response — returned verbatim on duplicate requests
+  responseStatus Int? // HTTP status code: 200, 201, 409, 422, etc.
+  responseBody   Json? // Serialized response body
+
+  expiresAt DateTime // Key expires after TTL (typically createdAt + 24h)
+  createdAt DateTime @default(now())
+
+  @@index([expiresAt])
+  @@map("idempotency_keys")
+}
